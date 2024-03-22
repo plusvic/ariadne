@@ -2,7 +2,7 @@ use std::borrow::Borrow;
 use std::io;
 use std::ops::Range;
 
-use crate::{IndexType, LabelDisplay};
+use crate::{IndexType, LabelDisplay, Line, Source};
 
 use super::draw::{self, StreamAwareFmt, StreamType};
 use super::{Cache, CharSet, LabelAttach, Report, ReportKind, Show, Span, Write};
@@ -39,6 +39,18 @@ struct SourceGroup<'a, S: Span> {
 }
 
 impl<S: Span> Report<'_, S> {
+    /// Get the line containing the given offset.
+    /// 
+    /// The `offset` is either a character offset or a byte offset, depending on the configuration
+    /// when the [`Report`] was created. .with_index_type(IndexType::Char)
+    pub fn get_line<I: AsRef<str>>(&self, src: &Source<I>, offset: usize) -> Option<(Line, usize, usize)> {
+        match self.config.index_type {
+            IndexType::Byte => src.get_byte_line(offset),
+            IndexType::Char => src.get_offset_line(offset),
+        }
+    }
+    
+    
     fn get_source_groups(&self, cache: &mut impl Cache<S::SourceId>) -> Vec<SourceGroup<S>> {
         let mut groups = Vec::new();
         for label in self.labels.iter() {
@@ -55,42 +67,23 @@ impl<S: Span> Report<'_, S> {
 
             let given_label_span = label.span.start()..label.span.end();
 
-            let (label_char_span, start_line, end_line) = match self.config.index_type {
-                IndexType::Char => {
-                    let Some(start_line) = src.get_offset_line(given_label_span.start) else {continue};
-                    let end_line = if given_label_span.start >= given_label_span.end {
-                        start_line.1
-                    } else {
-                        let Some(end_line) = src.get_offset_line(given_label_span.end - 1) else {continue};
-                        end_line.1
-                    };
-                    (given_label_span, start_line.1, end_line)
-                },
-                IndexType::Byte => {
-                    let Some((start_line_obj, start_line, start_byte_col)) = src.get_byte_line(given_label_span.start) else {continue;};
-                    let line_text = src.get_line_text(start_line_obj).unwrap();
-
-                    let num_chars_before_start = line_text[..start_byte_col.min(line_text.len())]
-                        .chars()
-                        .count();
-                    let start_char_offset = start_line_obj.offset() + num_chars_before_start;
-
-                    if given_label_span.start >= given_label_span.end {
-                        (start_char_offset..start_char_offset, start_line, start_line)
-                    } else {
-                        // We can subtract 1 from end, because get_byte_line doesn't actually index into the text. 
-                        let end_pos = given_label_span.end - 1;
-                        let Some((end_line_obj, end_line, end_byte_col)) = src.get_byte_line(end_pos) else {continue};
-                        let end_line_text = src.get_line_text(start_line_obj).unwrap();
-                        // Have to add 1 back now, so we don't cut a char in two. 
-                        let num_chars_before_end = end_line_text[..end_byte_col+1].chars().count();
-                        let end_char_offset = end_line_obj.offset() + num_chars_before_end;
-
-                        (start_char_offset..end_char_offset, start_line, end_line)
-                    }
-                }
+            let (label_char_span, start_line, end_line) = {
+                let Some(start_line) = self.get_line(src, given_label_span.start) else {continue};
+                let end_line = if given_label_span.start >= given_label_span.end {
+                    start_line.1
+                } else {
+                    let Some(end_line) = self.get_line(src, given_label_span.end) else {continue};
+                    end_line.1
+                };
+                let label_char_span = if matches!(self.config.index_type, IndexType::Byte) {
+                    let Some(label_char_span) = src.byte_to_char_span(given_label_span) else {continue};
+                    label_char_span
+                } else {
+                    given_label_span
+                };
+                (label_char_span, start_line.1, end_line)
             };
-
+            
             let label_info = LabelInfo {
                 kind: if start_line == end_line {
                     LabelKind::Inline
@@ -220,18 +213,18 @@ impl<S: Span> Report<'_, S> {
             };
 
             let line_range = src.get_line_range(&char_span);
-
+            
             // File name & reference
-            let location = if src_id == self.location.0.borrow() {
-                self.location.1
+            let line = if src_id == self.location.0.borrow() {
+                self.get_line(src, self.location.1)
             } else {
-                labels[0].char_span.start
+                src.get_offset_line(labels[0].char_span.start)
             };
-            let (line_no, col_no) = src
-                .get_offset_line(location)
-                .map(|(_, idx, col)| (format!("{}", idx + 1), format!("{}", col + 1)))
-                .unwrap_or_else(|| ('?'.to_string(), '?'.to_string()));
-            let line_ref = format!(":{}:{}", line_no, col_no);
+            
+            let line_ref = line
+                .map(|(_, line_no, col_no)| format!(":{}:{}", line_no + 1, col_no + 1))
+                .unwrap_or_else(|| ":?:?".to_string());
+            
             writeln!(
                 w,
                 "{}{}{}{}{}{}{}",
@@ -859,7 +852,7 @@ mod tests {
             // even with fonts where characters like '┬' take up more space.
             .with_char_set(CharSet::Ascii)
     }
-
+    
     #[test]
     fn one_message() {
         let msg = Report::<Range<usize>>::build(ReportKind::Error, (), 0)
@@ -888,6 +881,52 @@ mod tests {
            ,-[<unknown>:1:1]
            |
          1 | apple == orange;
+        ---'
+        "###);
+    }
+
+    #[test]
+    fn unicode_index_char() {
+        let source = "©©©© == ©©©©";
+        let msg = Report::<Range<usize>>::build(ReportKind::Error, (), 8)
+            .with_config(no_color_and_ascii())
+            .with_label(Label::new(0..4).with_message("Left expression"))
+            .with_label(Label::new(8..12).with_message("Right expression"))
+            .finish()
+            .write_to_string(Source::from(source));
+
+        assert_snapshot!(msg, @r###"
+        Error: 
+           ,-[<unknown>:1:9]
+           |
+         1 | ©©©© == ©©©©
+           | ^^|^    ^^|^  
+           |   `----------- Left expression
+           |           |   
+           |           `--- Right expression
+        ---'
+        "###);
+    }
+
+    #[test]
+    fn unicode_index_bytes() {
+        let source = "©©©© == ©©©©";
+        let msg = Report::<Range<usize>>::build(ReportKind::Error, (), 12)
+            .with_config(no_color_and_ascii().with_index_type(IndexType::Byte))
+            .with_label(Label::new(0..8).with_message("Left expression"))
+            .with_label(Label::new(12..20).with_message("Right expression"))
+            .finish()
+            .write_to_string(Source::from(source));
+
+        assert_snapshot!(msg, @r###"
+        Error: 
+           ,-[<unknown>:1:9]
+           |
+         1 | ©©©© == ©©©©
+           | ^^|^    ^^|^  
+           |   `----------- Left expression
+           |           |   
+           |           `--- Right expression
         ---'
         "###);
     }
@@ -1002,8 +1041,8 @@ mod tests {
            ,-[<unknown>:1:1]
            |
          1 | apple ==
-           |         | 
-           |         `- Unexpected end of file
+           |          | 
+           |          `- Unexpected end of file
         ---'
         "###);
     }

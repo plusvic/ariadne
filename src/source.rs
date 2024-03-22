@@ -156,7 +156,7 @@ impl<I: AsRef<str>> Source<I> {
     /// Return an iterator over the [`Line`]s in this source.
     pub fn lines(&self) -> impl ExactSizeIterator<Item = Line> + '_ { self.lines.iter().copied() }
 
-    /// Get the line that the given offset appears on, and the line/column numbers of the offset.
+    /// Get the line containing the given character offset, and the line/column numbers of the offset.
     ///
     /// Note that the line/column numbers are zero-indexed.
     pub fn get_offset_line(&self, offset: usize) -> Option<(Line, usize, usize)> {
@@ -178,8 +178,10 @@ impl<I: AsRef<str>> Source<I> {
         }
     }
 
-    /// Get the line that the given byte offset appears on, and the line/byte column numbers of the offset.
+    /// Get the line containing the given byte offset, and the line/column numbers of the offset.
     ///
+    /// The `byte_offset` must be a valid UTF-8 boundary, if not, the result will be `None`.
+    /// 
     /// Note that the line/column numbers are zero-indexed.
     pub fn get_byte_line(&self, byte_offset: usize) -> Option<(Line, usize, usize)> {
         if byte_offset <= self.byte_len {
@@ -194,12 +196,27 @@ impl<I: AsRef<str>> Source<I> {
                 byte_offset,
                 line.byte_offset
             );
-            Some((line, idx, byte_offset - line.byte_offset))
+
+            // The column number is the number of chars from the start of the line to byte_offset.
+            let col = self.text.as_ref().get(line.byte_offset..byte_offset)?.chars().count();
+            
+            Some((line, idx, col))
         } else {
             None
         }
     }
+    
+    /// Converts a byte span to a char span.
+    /// 
+    /// The `span` must start and end at valid UTF-8 boundaries, otherwise the result will `None`.
+    pub fn byte_to_char_span(&self, span: Range<usize>) -> Option<Range<usize>> {
+        let (line, _, col) = self.get_byte_line(span.start)?;
+        
+        let span_len_in_chars = &self.text.as_ref().get(span)?.chars().count();
 
+        Some(line.offset + col..line.offset + col + span_len_in_chars)
+    }
+    
     /// Get the range of lines that this span runs across.
     ///
     /// The resulting range is guaranteed to contain valid line indices (i.e: those that can be used for

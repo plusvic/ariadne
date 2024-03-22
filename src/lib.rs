@@ -418,7 +418,7 @@ impl Config {
     pub fn with_char_set(mut self, char_set: CharSet) -> Self { self.char_set = char_set; self }
     /// Should this report use byte spans instead of char spans?
     ///
-    /// If unspecified, this defaults to 'false'
+    /// If unspecified, this defaults to chars spans.
     pub fn with_index_type(mut self, index_type : IndexType) -> Self { self.index_type = index_type; self }
 
     fn error_color(&self) -> Option<Color> { Some(Color::Red).filter(|_| self.color) }
